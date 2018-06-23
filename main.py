@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import shutil
 import time
 
@@ -21,70 +22,10 @@ import numpy as np
 import PIL.Image as Image
 from collections import OrderedDict
 
-
-class TestDataset(Dataset):
-    def __init__(self, transform=None):
-        self.transform = transform
-
-        self.data = pd.read_csv("./data/train.csv")
-        self.sorted_cls = sorted(list(set(self.data['Id'].tolist())))
-
-        self.dictcls = OrderedDict()
-        for i, cls in enumerate(self.sorted_cls):
-            self.dictcls[i] = cls
-
-        with open("testlist.txt", 'r') as f:
-            self.names = f.read().splitlines()
-
-    def __getitem__(self, index):
-
-        img = Image.open('./data/test/'+self.names[index]).convert('RGB')
-
-        if self.transform is not None:
-            img = self.transform(img)
-
-        return self.names[index], img, 0
-
-    def __len__(self):
-        return len(self.names)
-
-
-class CustomDatasetFromCSV(Dataset):
-    def __init__(self, csv_path, transform=None):
-        """
-        Args:
-            csv_path (string): path to csv file
-            transform: pytorch transforms for transforms and tensor conversion
-        """
-        self.data = pd.read_csv(csv_path)
-        print(self.data.head())
-        self.labels = np.asarray(self.data.iloc[:, 0])
-        self.transform = transform
-
-        self.sorted_cls = sorted(list(set(self.data['Id'].tolist())))
-        print(len(self.sorted_cls))
-        print(self.sorted_cls[:10])
-
-        self.clsdict = OrderedDict()
-        for i, cls in enumerate(self.sorted_cls):
-            self.clsdict[cls] = i
-
-
-    def __getitem__(self, index):
-        row = self.data.loc[[index]]
-        imgpath, label = row.values.tolist()[0]
-        cls_n = self.clsdict[label]
-
-        img = Image.open('./data/train/'+imgpath).convert('RGB')
-
-        if self.transform is not None:
-            img = self.transform(img)
-
-        return img, cls_n
-
-    def __len__(self):
-        return len(self.data.index)
-
+from c_datasets import *
+from c_models import my_resnet18
+from c_losses import CenterLoss
+import _pickle as pickle
 
 
 
@@ -143,13 +84,15 @@ def main():
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size)
 
-    # create model
-    if args.pretrained:
-        print("=> using pre-trained model '{}'".format(args.arch))
-        model = models.__dict__[args.arch](num_classes=4251, pretrained=True)
-    else:
-        print("=> creating model '{}'".format(args.arch))
-        model = models.__dict__[args.arch](num_classes=4251)
+    # # create model
+    # if args.pretrained:
+    #     print("=> using pre-trained model '{}'".format(args.arch))
+    #     model = models.__dict__[args.arch](num_classes=4251, pretrained=True)
+    # else:
+    #     print("=> creating model '{}'".format(args.arch))
+    #     model = models.__dict__[args.arch](num_classes=4251)
+
+    model = my_resnet18(num_classes=4251)
 
     if not args.distributed:
         if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
@@ -162,12 +105,16 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(model)
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion_ce = nn.CrossEntropyLoss().cuda()
+    criterion_cent = CenterLoss(num_classes=4251, feat_dim=128, use_gpu=True)
 
-    # optimizer = torch.optim.SGD(model.parameters(), args.lr,
-    #                             momentum=args.momentum,
-    #                             weight_decay=args.weight_decay)
-    optimizer = torch.optim.Adam(model.parameters(), args.lr)
+    optimizer_ce = torch.optim.SGD(model.parameters(), args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
+    optimizer_cent = torch.optim.SGD(criterion_cent.parameters(), 0.1,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
+    #optimizer = torch.optim.Adam(model.parameters(), args.lr)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -177,7 +124,7 @@ def main():
             args.start_epoch = checkpoint['epoch']
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            #optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
@@ -194,8 +141,18 @@ def main():
     train_dataset = CustomDatasetFromCSV(
         "./data/train.csv",
         transforms.Compose([
-            transforms.RandomResizedCrop(224),
+            transforms.Resize((240, 485)),
+            transforms.CenterCrop((240, 485)),
             transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ]))
+
+    val_dataset = CustomDatasetFromCSV(
+        "./data/valdata.csv",
+        transforms.Compose([
+            transforms.Resize((240, 485)),
+            transforms.CenterCrop((240, 485)),
             transforms.ToTensor(),
             normalize,
         ]))
@@ -206,14 +163,18 @@ def main():
         train_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
-    val_loader = train_loader
     val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+
+
+    test_loader = torch.utils.data.DataLoader(
         TestDataset(transforms.Compose([
-            transforms.Resize(224),
-            transforms.CenterCrop(224),
+            transforms.Resize((240, 485)),
+            transforms.CenterCrop((240, 485)),
             transforms.ToTensor(),
             normalize,
         ])),
@@ -221,15 +182,18 @@ def main():
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, model, criterion)
+        #validate(val_loader, model, criterion)
+        validate(train_loader, model, criterion_ce)
+
+        time.sleep(5)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch)
+        adjust_learning_rate(optimizer_ce, epoch)
 
-        prec1 = train(train_loader, model, criterion, optimizer, epoch)
+        prec1 = train(train_loader, model, criterion_cent, criterion_ce, optimizer_cent, optimizer_ce, epoch)
 
         #prec1 = validate(val_loader, model, criterion)
 
@@ -240,11 +204,20 @@ def main():
             'arch': args.arch,
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
-            'optimizer' : optimizer.state_dict(),
+            'optimizer' : optimizer_ce.state_dict(),
         }, is_best)
+        
+        if epoch % 10 == 0:
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'state_dict': model.state_dict(),
+                'best_prec1': best_prec1,
+                'optimizer' : optimizer_ce.state_dict(),
+            }, False, filename="model_epoch_"+str(epoch)+'.pth.tar')
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion_cent, criterion_ce, optimizer_cent, optimizer_ce, epoch):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -255,7 +228,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
     model.train()
 
     end = time.time()
-    for i, (input, target) in enumerate(train_loader):
+    for i, (name, input, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -263,18 +236,25 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         # compute output
         output = model(input)
-        loss = criterion(output, target)
+        feat, out = output
+        loss1 = criterion_cent(feat, target)
+        loss2 = criterion_ce(out, target)
+        loss = 0.05*loss1 + loss2
 
         # measure accuracy and record loss
-        prec1, prec5 = accuracy(output, target, topk=(1, 5))
+        prec1, prec5 = accuracy(out, target, topk=(1, 5))
         losses.update(loss.item(), input.size(0))
         top1.update(prec1[0], input.size(0))
         top5.update(prec5[0], input.size(0))
 
         # compute gradient and do SGD step
-        optimizer.zero_grad()
+        optimizer_cent.zero_grad()
+        optimizer_ce.zero_grad()
         loss.backward()
-        optimizer.step()
+        optimizer_ce.step()
+        #for param in criterion_cent.parameters():
+        #    param.grad.data *= (1. / 0.5)
+        optimizer_cent.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -289,6 +269,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, top1=top1, top5=top5))
+            sys.stdout.flush()
 
     print(' *T Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
           .format(top1=top1, top5=top5))
@@ -305,6 +286,10 @@ def validate(val_loader, model, criterion):
     # switch to evaluate mode
     model.eval()
 
+    embs = np.zeros(shape=(len(val_loader.dataset), 128), dtype=np.float32)
+    t = 0
+
+    d = OrderedDict()
     print("Image,Id")
     with torch.no_grad():
         end = time.time()
@@ -313,20 +298,25 @@ def validate(val_loader, model, criterion):
 
             # compute output
             output = model(input)
-            if True:
+            emb, out = output
+            if args.evaluate:
                 sm = nn.Softmax(dim=1).cuda()
-                output_res = sm(output)
+                output_res = sm(out)
                 _, pred = output_res.topk(5, 1, True, True)
                 for pic_i in range(input.shape[0]):
                     labels = [0,0,0,0,0]
                     for pr_i, cl_i in enumerate(pred[pic_i]):
                         labels[pr_i] = val_loader.dataset.dictcls[cl_i.item()]
                     print('{},{} {} {} {} {}'.format(name[pic_i], *labels))
+                    d[name[pic_i]] = (labels[0])
+                    embs[t] = emb[pic_i].cpu().numpy()
+                    t += 1
+
                 continue
-            loss = criterion(output, target)
+            loss = criterion(out, target)
 
             # measure accuracy and record loss
-            prec1, prec5 = accuracy(output, target, topk=(1, 5))
+            prec1, prec5 = accuracy(out, target, topk=(1, 5))
             losses.update(loss.item(), input.size(0))
             top1.update(prec1[0], input.size(0))
             top5.update(prec5[0], input.size(0))
@@ -343,9 +333,15 @@ def validate(val_loader, model, criterion):
                       'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                        i, len(val_loader), batch_time=batch_time, loss=losses,
                        top1=top1, top5=top5))
+                sys.stdout.flush()
 
         print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
+
+    with open("emb_train.pkl", 'wb') as f:
+       pickle.dump(d, f)
+    with open("emb_train1.pkl", 'wb') as f:
+       np.save(f, embs)
 
     return top1.avg
 
@@ -376,7 +372,7 @@ class AverageMeter(object):
 
 def adjust_learning_rate(optimizer, epoch):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args.lr * (0.1 ** (epoch // 30))
+    lr = args.lr * (0.1 ** (epoch // 20))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
